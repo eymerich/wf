@@ -5,8 +5,11 @@
 package wf
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"net/netip"
 	"reflect"
 	"time"
@@ -23,6 +26,12 @@ type Session struct {
 	handle windows.Handle
 	// layerTypes is a map of layer ID -> field ID -> Go type for that field.
 	layerTypes layerTypes
+
+	ctxTransaction       context.Context
+	ctxTransactionCCF    context.CancelCauseFunc
+	ctxTransactionFuture chan error
+
+	l zerolog.Logger
 }
 
 // Options configures a Session.
@@ -43,6 +52,7 @@ type Options struct {
 	// wait to acquire the global transaction lock. If zero, WFP's
 	// default timeout (15 seconds) is used.
 	TransactionStartTimeout time.Duration
+	Logger                  *zerolog.Logger
 }
 
 // New connects to the WFP API.
@@ -81,14 +91,31 @@ func New(opts *Options) (*Session, error) {
 		ret.layerTypes[layer.ID] = fields
 	}
 
+	if opts.Logger != nil {
+		ret.l = *opts.Logger
+	}
+	ret.l = log.Logger.
+		With().
+		Str("service", "wfp lib").
+		Str("module", "session").
+		Logger()
+
 	return ret, nil
 }
 
 // Close implements io.Closer.
 func (s *Session) Close() error {
+	l := s.l.With().Str("action", "close").Logger()
+	l.Debug().Msg("Init")
+
 	if s.handle == 0 {
 		return nil
 	}
+
+	if s.ctxTransaction != nil {
+		_ = s.TransactionAbort()
+	}
+
 	err := fwpmEngineClose0(s.handle)
 	s.handle = 0
 	return err
@@ -754,4 +781,122 @@ func (s *Session) getEventPage(enum windows.Handle) ([]*DropEvent, error) {
 	defer fwpmFreeMemory0((*struct{})(unsafe.Pointer(&array)))
 
 	return fromNetEvent1(array, num)
+}
+
+type TransactionType uint32
+
+const (
+	TransactionRW = TransactionType(0)
+	TransactionR  = TransactionType(1)
+)
+
+var (
+	ErrTransactionAlreadyExists = errors.New("transaction already exists")
+	ErrTransactionNotExists     = errors.New("transaction does not exist")
+	ErrTransactionAbort         = errors.New("transaction abort")
+	ErrTransactionCommit        = errors.New("transaction commit")
+)
+
+func (s *Session) TransactionBegin(ctx context.Context, t TransactionType) error {
+	l := s.l.With().Str("action", "transaction begin").Logger()
+	l.Debug().Msg("Init")
+
+	if s.ctxTransaction != nil {
+		select {
+		case <-s.ctxTransaction.Done():
+			// Transaction context is no more valid
+			l.Debug().Msg("Transaction context not exists")
+			break
+		default:
+			// Transaction still alive
+			l.Debug().Msg("Transaction context already exists")
+			return ErrTransactionAlreadyExists
+		}
+	}
+	err := fwpmTransactionBegin0(s.handle, uint32(t))
+	if err != nil {
+		return err
+	}
+
+	if s.ctxTransactionFuture != nil {
+		// Invalidate previous future
+		select {
+		case <-s.ctxTransactionFuture:
+			break
+		default:
+			l.Debug().Msg("Closing future")
+			close(s.ctxTransactionFuture)
+		}
+	}
+	s.ctxTransactionFuture = make(chan error)
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.ctxTransaction, s.ctxTransactionCCF = context.WithCancelCause(ctx)
+	l.Debug().Msg("Transaction new context")
+	go func() {
+		defer close(s.ctxTransactionFuture)
+		ll := l.With().Str("goroutine", "context").Logger()
+
+		select {
+		case <-s.ctxTransaction.Done():
+			cause := context.Cause(s.ctxTransaction)
+			ll.Debug().Msgf("Transaction context done with: %s", cause)
+			switch {
+			case errors.Is(cause, ErrTransactionCommit):
+				ll.Debug().Msg("Invoking WFP transaction commit")
+				err = fwpmTransactionCommit0(s.handle)
+				s.ctxTransactionFuture <- err
+			default:
+				ll.Debug().Msg("Invoking WFP transaction abort")
+				err = fwpmTransactionAbort0(s.handle)
+				s.ctxTransactionFuture <- err
+			}
+		}
+		ll.Debug().Msg("Goroutine done")
+	}()
+	return nil
+}
+
+func (s *Session) TransactionCommit() error {
+	l := s.l.With().Str("action", "transaction commit").Logger()
+	l.Debug().Msg("Init")
+
+	if s.ctxTransaction == nil {
+		return ErrTransactionNotExists
+	}
+
+	select {
+	case <-s.ctxTransaction.Done():
+		// Transaction context is no more valid
+		l.Debug().Msg("Transaction context not exists")
+		return ErrTransactionNotExists
+	default:
+		// Transaction still alive
+		l.Debug().Msg("Transaction context exists, sending commit")
+		s.ctxTransactionCCF(ErrTransactionCommit)
+		return <-s.ctxTransactionFuture
+	}
+}
+
+func (s *Session) TransactionAbort() error {
+	l := s.l.With().Str("action", "transaction abort").Logger()
+	l.Debug().Msg("Init")
+
+	if s.ctxTransaction == nil {
+		return ErrTransactionNotExists
+	}
+
+	select {
+	case <-s.ctxTransaction.Done():
+		// Transaction context is no more valid
+		l.Debug().Msg("Transaction context not exists")
+		return ErrTransactionNotExists
+	default:
+		// Transaction still alive
+		l.Debug().Msg("Transaction context exists, sending abort")
+		s.ctxTransactionCCF(ErrTransactionAbort)
+		return <-s.ctxTransactionFuture
+	}
 }
